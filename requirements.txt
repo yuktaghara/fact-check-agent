@@ -1,5 +1,5 @@
 streamlit
 pypdf
-google-genai
+groq
 tavily-python
 pydantic
