@@ -1,9 +1,10 @@
+
 import os
+import re
 import json
 import streamlit as st
 from pypdf import PdfReader
-from pydantic import BaseModel, Field
-from typing import List, Literal
+from typing import List
 from groq import Groq
 from tavily import TavilyClient
 
@@ -14,18 +15,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- PYDANTIC SCHEMAS ---
-class ExtractedClaims(BaseModel):
-    claims: List[str] = Field(
-        description="List of specific, objective, verifiable factual claims."
-    )
-
-class VerificationVerdict(BaseModel):
-    status: Literal["Verified", "Inaccurate", "False"]
-    explanation: str
-    real_fact: str
-    source_url: str
-
 # --- API INITIALIZATION ---
 def get_keys():
     groq_key = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
@@ -33,11 +22,12 @@ def get_keys():
     return groq_key, tavily_key
 
 def get_active_groq_model(groq_client: Groq) -> str:
-    """Automatically detects the best active text generation model on your Groq account."""
+    """Selects a fast, reliable standard chat model (skipping reasoning/audio models)."""
     models = groq_client.models.list().data
+    blocked = ["whisper", "guard", "tts", "embed", "vision", "oss", "r1", "qwq", "compound"]
     available_ids = [
         m.id for m in models
-        if not any(skip in m.id.lower() for skip in ["whisper", "guard", "tts", "embed", "vision"])
+        if not any(b in m.id.lower() for b in blocked)
     ]
     preferred = [
         "llama-3.3-70b-versatile",
@@ -45,15 +35,27 @@ def get_active_groq_model(groq_client: Groq) -> str:
         "meta-llama/llama-4-scout-17b-16e-instruct",
         "llama-3.1-70b-versatile",
         "llama-3.1-8b-instant",
-        "qwen-qwq-32b",
         "gemma2-9b-it",
+        "qwen/qwen3-32b",
     ]
     for p in preferred:
         if p in available_ids:
             return p
     if available_ids:
         return available_ids[0]
-    raise RuntimeError("No active text models found on this Groq API key.")
+    # Fallback to any non-audio model if all were filtered
+    fallback = [m.id for m in models if not any(b in m.id.lower() for b in ["whisper", "guard", "tts", "embed"])]
+    return fallback[0]
+
+def extract_json_safely(raw_text: str) -> dict:
+    """Strips any thinking tags or markdown fences and parses JSON cleanly."""
+    cleaned = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL).strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+    if match:
+        return json.loads(match.group(0))
+    return json.loads(cleaned)
 
 # --- CORE PIPELINE FUNCTIONS ---
 def extract_text_from_pdf(uploaded_file) -> str:
@@ -76,7 +78,7 @@ def extract_claims(groq_client: Groq, model_name: str, text: str) -> List[str]:
 
     Ignore subjective opinions, promotional slogans, and general advice. Extract up to 15 of the most critical factual claims.
 
-    Return ONLY valid JSON matching this exact schema:
+    Respond ONLY with a valid JSON object in this exact format:
     {{"claims": ["claim 1", "claim 2"]}}
 
     Document Text:
@@ -85,16 +87,16 @@ def extract_claims(groq_client: Groq, model_name: str, text: str) -> List[str]:
     response = groq_client.chat.completions.create(
         model=model_name,
         messages=[
-            {"role": "system", "content": "You are a precise JSON-outputting fact extraction assistant. Output valid JSON only."},
+            {"role": "system", "content": "You are a precise fact extraction assistant. Return raw valid JSON only, with no extra text."},
             {"role": "user", "content": prompt}
         ],
-        response_format={"type": "json_object"},
         temperature=0.1,
     )
-    data = json.loads(response.choices[0].message.content)
+    data = extract_json_safely(response.choices[0].message.content)
     return data.get("claims", [])
 
 def verify_claim(groq_client: Groq, model_name: str, tavily_client: TavilyClient, claim: str) -> dict:
+    # 1. Search Live Web
     search_response = tavily_client.search(
         query=claim,
         search_depth="advanced",
@@ -106,6 +108,7 @@ def verify_claim(groq_client: Groq, model_name: str, tavily_client: TavilyClient
         [f"Source: {r.get('url')}\nTitle: {r.get('title')}\nSnippet: {r.get('content')}" for r in results]
     )
 
+    # 2. Cross-reference with LLM
     judge_prompt = f"""
     You are a strict Fact-Checking Judge. Compare the Claim extracted from a PDF against the Live Web Search Evidence.
     Note: Current year is 2026. Pay close attention to whether statistics or figures in the claim are outdated compared to the latest available data.
@@ -121,9 +124,9 @@ def verify_claim(groq_client: Groq, model_name: str, tavily_client: TavilyClient
     - "Inaccurate": The claim is based on a real topic/entity, but the statistic, date, or figure is outdated, exaggerated, or wrong.
     - "False": The claim is completely fabricated, contradicts consensus facts, or has zero credible evidence supporting it.
 
-    Return ONLY valid JSON matching this exact schema:
+    Respond ONLY with a valid JSON object in this exact format:
     {{
-      "status": "Verified" | "Inaccurate" | "False",
+      "status": "Verified",
       "explanation": "Concise 1-2 sentence explanation comparing the PDF claim against live web evidence.",
       "real_fact": "The accurate, up-to-date fact or statistic found in the web search results.",
       "source_url": "The most authoritative URL from the search results supporting this verdict, or 'None found' if False."
@@ -132,13 +135,12 @@ def verify_claim(groq_client: Groq, model_name: str, tavily_client: TavilyClient
     response = groq_client.chat.completions.create(
         model=model_name,
         messages=[
-            {"role": "system", "content": "You are a strict fact-checking judge that outputs valid JSON only."},
+            {"role": "system", "content": "You are a strict fact-checking judge. Return raw valid JSON only, with no extra text."},
             {"role": "user", "content": judge_prompt}
         ],
-        response_format={"type": "json_object"},
         temperature=0.0,
     )
-    verdict = json.loads(response.choices[0].message.content)
+    verdict = extract_json_safely(response.choices[0].message.content)
     verdict["claim"] = claim
     return verdict
 
