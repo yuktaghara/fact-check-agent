@@ -66,7 +66,7 @@ def extract_claims(gemini_client: genai.Client, text: str) -> List[str]:
     {text[:15000]}
     """
     response = gemini_client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-flash-latest",
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -109,7 +109,7 @@ def verify_claim(gemini_client: genai.Client, tavily_client: TavilyClient, claim
     Provide the exact corrected/real fact in `real_fact` and include the best `source_url`.
     """
     response = gemini_client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-flash-latest",
         contents=judge_prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -155,67 +155,70 @@ if uploaded_file is not None:
         st.stop()
 
     if st.button("🚀 Run Automated Fact-Check", type="primary"):
-        gemini_client = genai.Client(api_key=gemini_key)
-        tavily_client = TavilyClient(api_key=tavily_key)
+        try:
+            gemini_client = genai.Client(api_key=gemini_key)
+            tavily_client = TavilyClient(api_key=tavily_key)
 
-        with st.status("Analyzing document...", expanded=True) as status:
-            st.write("📄 Extracting text from PDF...")
-            raw_text = extract_text_from_pdf(uploaded_file)
-            
-            if not raw_text:
-                st.error("Could not extract text from this PDF. Ensure it is not a scanned image-only PDF.")
-                st.stop()
+            with st.status("Analyzing document...", expanded=True) as status:
+                st.write("📄 Extracting text from PDF...")
+                raw_text = extract_text_from_pdf(uploaded_file)
+                
+                if not raw_text:
+                    st.error("Could not extract text from this PDF. Ensure it is not a scanned image-only PDF.")
+                    st.stop()
 
-            st.write("🧠 Identifying verifiable claims (stats, dates, figures)...")
-            claims = extract_claims(gemini_client, raw_text)
-            st.write(f"Found **{len(claims)}** verifiable claims.")
+                st.write("🧠 Identifying verifiable claims (stats, dates, figures)...")
+                claims = extract_claims(gemini_client, raw_text)
+                st.write(f"Found **{len(claims)}** verifiable claims.")
 
-            if not claims:
-                st.warning("No specific statistical or factual claims were detected in this PDF.")
-                st.stop()
+                if not claims:
+                    st.warning("No specific statistical or factual claims were detected in this PDF.")
+                    st.stop()
 
-            results = []
-            progress_bar = st.progress(0)
-            for idx, claim in enumerate(claims):
-                st.write(f"🌐 Verifying ({idx + 1}/{len(claims)}): *{claim[:80]}...*")
-                verdict = verify_claim(gemini_client, tavily_client, claim)
-                results.append(verdict)
-                progress_bar.progress((idx + 1) / len(claims))
+                results = []
+                progress_bar = st.progress(0)
+                for idx, claim in enumerate(claims):
+                    st.write(f"🌐 Verifying ({idx + 1}/{len(claims)}): *{claim[:80]}...*")
+                    verdict = verify_claim(gemini_client, tavily_client, claim)
+                    results.append(verdict)
+                    progress_bar.progress((idx + 1) / len(claims))
 
-            status.update(label="Fact-Check Complete!", state="complete", expanded=False)
+                status.update(label="Fact-Check Complete!", state="complete", expanded=False)
 
-        # --- SUMMARY METRICS ---
-        verified_count = sum(1 for r in results if r["status"] == "Verified")
-        inaccurate_count = sum(1 for r in results if r["status"] == "Inaccurate")
-        false_count = sum(1 for r in results if r["status"] == "False")
+            # --- SUMMARY METRICS ---
+            verified_count = sum(1 for r in results if r["status"] == "Verified")
+            inaccurate_count = sum(1 for r in results if r["status"] == "Inaccurate")
+            false_count = sum(1 for r in results if r["status"] == "False")
 
-        st.divider()
-        st.subheader("📊 Audit Summary")
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total Claims Checked", len(results))
-        col2.metric("✅ Verified", verified_count)
-        col3.metric("⚠️ Inaccurate / Outdated", inaccurate_count)
-        col4.metric("🚨 False / Hallucinated", false_count)
+            st.divider()
+            st.subheader("📊 Audit Summary")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Total Claims Checked", len(results))
+            col2.metric("✅ Verified", verified_count)
+            col3.metric("⚠️ Inaccurate / Outdated", inaccurate_count)
+            col4.metric("🚨 False / Hallucinated", false_count)
 
-        st.divider()
-        st.subheader("📋 Detailed Claim-by-Claim Report")
+            st.divider()
+            st.subheader("📋 Detailed Claim-by-Claim Report")
 
-        # Display False & Inaccurate claims first so traps stand out immediately
-        priority_order = {"False": 0, "Inaccurate": 1, "Verified": 2}
-        sorted_results = sorted(results, key=lambda x: priority_order.get(x["status"], 3))
+            priority_order = {"False": 0, "Inaccurate": 1, "Verified": 2}
+            sorted_results = sorted(results, key=lambda x: priority_order.get(x["status"], 3))
 
-        for item in sorted_results:
-            status_label = item["status"]
-            with st.container(border=True):
-                if status_label == "Verified":
-                    st.success(f"✅ **VERIFIED:** {item['claim']}")
-                elif status_label == "Inaccurate":
-                    st.warning(f"⚠️ **INACCURATE / OUTDATED:** {item['claim']}")
-                else:
-                    st.error(f"🚨 **FALSE / NO EVIDENCE:** {item['claim']}")
+            for item in sorted_results:
+                status_label = item["status"]
+                with st.container(border=True):
+                    if status_label == "Verified":
+                        st.success(f"✅ **VERIFIED:** {item['claim']}")
+                    elif status_label == "Inaccurate":
+                        st.warning(f"⚠️ **INACCURATE / OUTDATED:** {item['claim']}")
+                    else:
+                        st.error(f"🚨 **FALSE / NO EVIDENCE:** {item['claim']}")
 
-                st.markdown(f"**Analysis:** {item['explanation']}")
-                if status_label != "Verified":
-                    st.info(f"**Correct / Real Fact:** {item['real_fact']}")
-                if item.get("source_url") and item["source_url"] != "None found":
-                    st.caption(f"🔗 Source: [{item['source_url']}]({item['source_url']})")
+                    st.markdown(f"**Analysis:** {item['explanation']}")
+                    if status_label != "Verified":
+                        st.info(f"**Correct / Real Fact:** {item['real_fact']}")
+                    if item.get("source_url") and item["source_url"] != "None found":
+                        st.caption(f"🔗 Source: [{item['source_url']}]({item['source_url']})")
+
+        except Exception as e:
+            st.error(f"API Error: {str(e)}")
