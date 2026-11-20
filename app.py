@@ -4,8 +4,7 @@ import streamlit as st
 from pypdf import PdfReader
 from pydantic import BaseModel, Field
 from typing import List, Literal
-from google import genai
-from google.genai import types
+from groq import Groq
 from tavily import TavilyClient
 
 # --- PAGE CONFIG ---
@@ -36,10 +35,10 @@ class VerificationVerdict(BaseModel):
     )
 
 # --- API INITIALIZATION ---
-def get_clients():
-    gemini_key = st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY")
+def get_keys():
+    groq_key = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
     tavily_key = st.secrets.get("TAVILY_API_KEY") or os.environ.get("TAVILY_API_KEY")
-    return gemini_key, tavily_key
+    return groq_key, tavily_key
 
 # --- CORE PIPELINE FUNCTIONS ---
 def extract_text_from_pdf(uploaded_file) -> str:
@@ -51,7 +50,7 @@ def extract_text_from_pdf(uploaded_file) -> str:
             text += extracted + "\n"
     return text.strip()
 
-def extract_claims(gemini_client: genai.Client, text: str) -> List[str]:
+def extract_claims(groq_client: Groq, text: str) -> List[str]:
     prompt = f"""
     You are an expert investigative fact-checker. Analyze the following document text and extract all specific, verifiable factual claims.
     Focus strictly on:
@@ -62,22 +61,25 @@ def extract_claims(gemini_client: genai.Client, text: str) -> List[str]:
 
     Ignore subjective opinions, promotional slogans, and general advice. Extract up to 15 of the most critical factual claims.
 
+    Return ONLY valid JSON matching this exact schema:
+    {{"claims": ["claim 1", "claim 2"]}}
+
     Document Text:
     {text[:15000]}
     """
-    response = gemini_client.models.generate_content(
-        model="gemini-flash-latest",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=ExtractedClaims,
-            temperature=0.1,
-        ),
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": "You are a precise JSON-outputting fact extraction assistant."},
+            {"role": "user", "content": prompt}
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.1,
     )
-    data = json.loads(response.text)
+    data = json.loads(response.choices[0].message.content)
     return data.get("claims", [])
 
-def verify_claim(gemini_client: genai.Client, tavily_client: TavilyClient, claim: str) -> dict:
+def verify_claim(groq_client: Groq, tavily_client: TavilyClient, claim: str) -> dict:
     # 1. Search Live Web
     search_response = tavily_client.search(
         query=claim,
@@ -90,7 +92,7 @@ def verify_claim(gemini_client: genai.Client, tavily_client: TavilyClient, claim
         [f"Source: {r.get('url')}\nTitle: {r.get('title')}\nSnippet: {r.get('content')}" for r in results]
     )
 
-    # 2. Cross-reference with Gemini
+    # 2. Cross-reference with LLM
     judge_prompt = f"""
     You are a strict Fact-Checking Judge. Compare the Claim extracted from a PDF against the Live Web Search Evidence.
     Note: Current year is 2026. Pay close attention to whether statistics or figures in the claim are outdated compared to the latest available data.
@@ -106,18 +108,24 @@ def verify_claim(gemini_client: genai.Client, tavily_client: TavilyClient, claim
     - "Inaccurate": The claim is based on a real topic/entity, but the statistic, date, or figure is outdated, exaggerated, or wrong.
     - "False": The claim is completely fabricated, contradicts consensus facts, or has zero credible evidence supporting it.
 
-    Provide the exact corrected/real fact in `real_fact` and include the best `source_url`.
+    Return ONLY valid JSON matching this exact schema:
+    {{
+      "status": "Verified" | "Inaccurate" | "False",
+      "explanation": "Concise 1-2 sentence explanation comparing the PDF claim against live web evidence.",
+      "real_fact": "The accurate, up-to-date fact or statistic found in the web search results.",
+      "source_url": "The most authoritative URL from the search results supporting this verdict, or 'None found' if False."
+    }}
     """
-    response = gemini_client.models.generate_content(
-        model="gemini-flash-latest",
-        contents=judge_prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=VerificationVerdict,
-            temperature=0.0,
-        ),
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": "You are a strict fact-checking judge that outputs valid JSON only."},
+            {"role": "user", "content": judge_prompt}
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.0,
     )
-    verdict = json.loads(response.text)
+    verdict = json.loads(response.choices[0].message.content)
     verdict["claim"] = claim
     return verdict
 
@@ -127,14 +135,14 @@ st.markdown(
     "Upload any marketing PDF, report, or whitepaper. The agent extracts factual claims, cross-references them against live web data, and flags outdated or hallucinated stats."
 )
 
-gemini_key, tavily_key = get_clients()
+groq_key, tavily_key = get_keys()
 
 with st.sidebar:
     st.header("⚙️ Configuration")
-    if not gemini_key:
-        gemini_key = st.text_input("Gemini API Key", type="password")
+    if not groq_key:
+        groq_key = st.text_input("Groq API Key", type="password")
     else:
-        st.success("Gemini API Key loaded")
+        st.success("Groq API Key loaded")
         
     if not tavily_key:
         tavily_key = st.text_input("Tavily API Key", type="password")
@@ -150,13 +158,13 @@ with st.sidebar:
 uploaded_file = st.file_uploader("Upload a PDF Document for Verification", type=["pdf"])
 
 if uploaded_file is not None:
-    if not gemini_key or not tavily_key:
-        st.error("Please provide both Gemini and Tavily API keys in the sidebar or Streamlit Secrets.")
+    if not groq_key or not tavily_key:
+        st.error("Please provide both Groq and Tavily API keys in the sidebar or Streamlit Secrets.")
         st.stop()
 
     if st.button("🚀 Run Automated Fact-Check", type="primary"):
         try:
-            gemini_client = genai.Client(api_key=gemini_key)
+            groq_client = Groq(api_key=groq_key)
             tavily_client = TavilyClient(api_key=tavily_key)
 
             with st.status("Analyzing document...", expanded=True) as status:
@@ -168,7 +176,7 @@ if uploaded_file is not None:
                     st.stop()
 
                 st.write("🧠 Identifying verifiable claims (stats, dates, figures)...")
-                claims = extract_claims(gemini_client, raw_text)
+                claims = extract_claims(groq_client, raw_text)
                 st.write(f"Found **{len(claims)}** verifiable claims.")
 
                 if not claims:
@@ -179,7 +187,7 @@ if uploaded_file is not None:
                 progress_bar = st.progress(0)
                 for idx, claim in enumerate(claims):
                     st.write(f"🌐 Verifying ({idx + 1}/{len(claims)}): *{claim[:80]}...*")
-                    verdict = verify_claim(gemini_client, tavily_client, claim)
+                    verdict = verify_claim(groq_client, tavily_client, claim)
                     results.append(verdict)
                     progress_bar.progress((idx + 1) / len(claims))
 
