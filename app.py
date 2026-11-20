@@ -1,4 +1,3 @@
-
 import os
 import re
 import json
@@ -22,30 +21,35 @@ def get_keys():
     return groq_key, tavily_key
 
 def get_active_groq_model(groq_client: Groq) -> str:
-    """Selects a fast, reliable standard chat model (skipping reasoning/audio models)."""
+    """Finds the first working chat model on your Groq account."""
     models = groq_client.models.list().data
-    blocked = ["whisper", "guard", "tts", "embed", "vision", "oss", "r1", "qwq", "compound"]
+    blocked = ["whisper", "guard", "tts", "embed", "vision", "orpheus", "canopylabs", "playai"]
     available_ids = [
         m.id for m in models
         if not any(b in m.id.lower() for b in blocked)
     ]
     preferred = [
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b",
         "llama-3.3-70b-versatile",
-        "meta-llama/llama-4-maverick-17b-128e-instruct",
-        "meta-llama/llama-4-scout-17b-16e-instruct",
-        "llama-3.1-70b-versatile",
         "llama-3.1-8b-instant",
-        "gemma2-9b-it",
-        "qwen/qwen3-32b",
+        "qwen/qwen3.8-27b",
+        "minimaxai/minimax-m2.7",
+        "meta-models/muse-spark-open",
     ]
-    for p in preferred:
-        if p in available_ids:
-            return p
-    if available_ids:
-        return available_ids[0]
-    # Fallback to any non-audio model if all were filtered
-    fallback = [m.id for m in models if not any(b in m.id.lower() for b in ["whisper", "guard", "tts", "embed"])]
-    return fallback[0]
+    ordered = [p for p in preferred if p in available_ids] + [m for m in available_ids if m not in preferred]
+
+    for candidate in ordered:
+        try:
+            groq_client.chat.completions.create(
+                model=candidate,
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=5,
+            )
+            return candidate
+        except Exception:
+            continue
+    raise RuntimeError("No working chat model found on this Groq key.")
 
 def extract_json_safely(raw_text: str) -> dict:
     """Strips any thinking tags or markdown fences and parses JSON cleanly."""
