@@ -14,31 +14,46 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- PYDANTIC SCHEMAS FOR STRUCTURED OUTPUT ---
+# --- PYDANTIC SCHEMAS ---
 class ExtractedClaims(BaseModel):
     claims: List[str] = Field(
-        description="List of specific, objective, verifiable factual claims (statistics, dates, financial figures, historical/technical facts). Exclude opinions, marketing fluff, or vague statements."
+        description="List of specific, objective, verifiable factual claims."
     )
 
 class VerificationVerdict(BaseModel):
-    status: Literal["Verified", "Inaccurate", "False"] = Field(
-        description="'Verified' if live search confirms the claim; 'Inaccurate' if the claim has outdated numbers, wrong dates, or partial distortions; 'False' if completely fabricated or contradicted with no supporting evidence."
-    )
-    explanation: str = Field(
-        description="Concise 1-2 sentence explanation comparing the PDF claim against live web evidence."
-    )
-    real_fact: str = Field(
-        description="The accurate, up-to-date fact or statistic found in the web search results. If Verified, restate the confirmed fact."
-    )
-    source_url: str = Field(
-        description="The most authoritative URL from the search results supporting this verdict, or 'None found' if False."
-    )
+    status: Literal["Verified", "Inaccurate", "False"]
+    explanation: str
+    real_fact: str
+    source_url: str
 
 # --- API INITIALIZATION ---
 def get_keys():
     groq_key = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
     tavily_key = st.secrets.get("TAVILY_API_KEY") or os.environ.get("TAVILY_API_KEY")
     return groq_key, tavily_key
+
+def get_active_groq_model(groq_client: Groq) -> str:
+    """Automatically detects the best active text generation model on your Groq account."""
+    models = groq_client.models.list().data
+    available_ids = [
+        m.id for m in models
+        if not any(skip in m.id.lower() for skip in ["whisper", "guard", "tts", "embed", "vision"])
+    ]
+    preferred = [
+        "llama-3.3-70b-versatile",
+        "meta-llama/llama-4-maverick-17b-128e-instruct",
+        "meta-llama/llama-4-scout-17b-16e-instruct",
+        "llama-3.1-70b-versatile",
+        "llama-3.1-8b-instant",
+        "qwen-qwq-32b",
+        "gemma2-9b-it",
+    ]
+    for p in preferred:
+        if p in available_ids:
+            return p
+    if available_ids:
+        return available_ids[0]
+    raise RuntimeError("No active text models found on this Groq API key.")
 
 # --- CORE PIPELINE FUNCTIONS ---
 def extract_text_from_pdf(uploaded_file) -> str:
@@ -50,7 +65,7 @@ def extract_text_from_pdf(uploaded_file) -> str:
             text += extracted + "\n"
     return text.strip()
 
-def extract_claims(groq_client: Groq, text: str) -> List[str]:
+def extract_claims(groq_client: Groq, model_name: str, text: str) -> List[str]:
     prompt = f"""
     You are an expert investigative fact-checker. Analyze the following document text and extract all specific, verifiable factual claims.
     Focus strictly on:
@@ -68,9 +83,9 @@ def extract_claims(groq_client: Groq, text: str) -> List[str]:
     {text[:15000]}
     """
     response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model=model_name,
         messages=[
-            {"role": "system", "content": "You are a precise JSON-outputting fact extraction assistant."},
+            {"role": "system", "content": "You are a precise JSON-outputting fact extraction assistant. Output valid JSON only."},
             {"role": "user", "content": prompt}
         ],
         response_format={"type": "json_object"},
@@ -79,8 +94,7 @@ def extract_claims(groq_client: Groq, text: str) -> List[str]:
     data = json.loads(response.choices[0].message.content)
     return data.get("claims", [])
 
-def verify_claim(groq_client: Groq, tavily_client: TavilyClient, claim: str) -> dict:
-    # 1. Search Live Web
+def verify_claim(groq_client: Groq, model_name: str, tavily_client: TavilyClient, claim: str) -> dict:
     search_response = tavily_client.search(
         query=claim,
         search_depth="advanced",
@@ -92,7 +106,6 @@ def verify_claim(groq_client: Groq, tavily_client: TavilyClient, claim: str) -> 
         [f"Source: {r.get('url')}\nTitle: {r.get('title')}\nSnippet: {r.get('content')}" for r in results]
     )
 
-    # 2. Cross-reference with LLM
     judge_prompt = f"""
     You are a strict Fact-Checking Judge. Compare the Claim extracted from a PDF against the Live Web Search Evidence.
     Note: Current year is 2026. Pay close attention to whether statistics or figures in the claim are outdated compared to the latest available data.
@@ -117,7 +130,7 @@ def verify_claim(groq_client: Groq, tavily_client: TavilyClient, claim: str) -> 
     }}
     """
     response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model=model_name,
         messages=[
             {"role": "system", "content": "You are a strict fact-checking judge that outputs valid JSON only."},
             {"role": "user", "content": judge_prompt}
@@ -166,8 +179,9 @@ if uploaded_file is not None:
         try:
             groq_client = Groq(api_key=groq_key)
             tavily_client = TavilyClient(api_key=tavily_key)
+            active_model = get_active_groq_model(groq_client)
 
-            with st.status("Analyzing document...", expanded=True) as status:
+            with st.status(f"Analyzing document using `{active_model}`...", expanded=True) as status:
                 st.write("📄 Extracting text from PDF...")
                 raw_text = extract_text_from_pdf(uploaded_file)
                 
@@ -176,7 +190,7 @@ if uploaded_file is not None:
                     st.stop()
 
                 st.write("🧠 Identifying verifiable claims (stats, dates, figures)...")
-                claims = extract_claims(groq_client, raw_text)
+                claims = extract_claims(groq_client, active_model, raw_text)
                 st.write(f"Found **{len(claims)}** verifiable claims.")
 
                 if not claims:
@@ -187,7 +201,7 @@ if uploaded_file is not None:
                 progress_bar = st.progress(0)
                 for idx, claim in enumerate(claims):
                     st.write(f"🌐 Verifying ({idx + 1}/{len(claims)}): *{claim[:80]}...*")
-                    verdict = verify_claim(groq_client, tavily_client, claim)
+                    verdict = verify_claim(groq_client, active_model, tavily_client, claim)
                     results.append(verdict)
                     progress_bar.progress((idx + 1) / len(claims))
 
